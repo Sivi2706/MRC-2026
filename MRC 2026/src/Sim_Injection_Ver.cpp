@@ -70,7 +70,7 @@
 #define CO2_EJECTION_SERVO_PIN     27
 
 // Servo positions in degrees. Change these values later to match the actual
-// mechanical linkage. For the CanSat doors, 180° = CLOSED and 90° = OPEN.
+// mechanical linkage. For the CanSat doors, 180° = CLOSED and 90° = OPEN.huohou;ou;ouh
 static const int CANSAT_TOP_INITIAL_ANGLE_DEG      = 180;
 static const int CANSAT_TOP_OPEN_ANGLE_DEG         = 90;
 static const int CANSAT_BOTTOM_INITIAL_ANGLE_DEG   = 180;
