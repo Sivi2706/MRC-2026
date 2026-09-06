@@ -7,8 +7,9 @@
 //
 //  Executes real-time 100 Hz dual Kalman filter (Filter A & Filter B),
 //  detects flight state transitions (PAD -> BOOST -> COAST -> DESCENT),
-//  confirms apogee velocity zero-crossing, ACTIVATES APOGEE DEPLOYMENT PIN,
-//  and prints prominent event logs to Serial console.
+//  confirms apogee velocity zero-crossing, ejects CO2 at apogee, deploys both
+//  CanSats together at 800 m AGL on descent, and includes a launch-referenced
+//  CO2 failsafe timer.
 // ============================================================================
 
 #include <Arduino.h>
@@ -17,6 +18,7 @@
 #include <SPI.h>
 #include <Adafruit_BMP280.h>
 #include <EEPROM.h>
+#include <ESP32Servo.h>
 #include <cmath>
 #include "sim_data.h"
 
@@ -61,22 +63,46 @@
 #define BLUE_LED_ACTIVE_HIGH 1
 #endif
 
-// ── Deployment / Trigger Pin Configuration ──────────────────────────────────
-#ifndef APOGEE_TRIGGER_PIN
-#define APOGEE_TRIGGER_PIN          25      // Safe ESP32 GPIO for pyro/ejection parachute trigger
-#endif
+// ── Servo deployment configuration ──────────────────────────────────────────
+// SG90 servo signal pins
+#define CANSAT_TOP_SERVO_PIN       25
+#define CANSAT_BOTTOM_SERVO_PIN    26
+#define CO2_EJECTION_SERVO_PIN     27
 
-#ifndef APOGEE_TRIGGER_ACTIVE_HIGH
-#define APOGEE_TRIGGER_ACTIVE_HIGH  1       // 1 = HIGH to fire, 0 = LOW to fire
-#endif
+// Servo positions in degrees. Change these values later to match the actual
+// mechanical linkage. For the CanSat doors, 180° = CLOSED and 90° = OPEN.
+static const int CANSAT_TOP_INITIAL_ANGLE_DEG      = 180;
+static const int CANSAT_TOP_OPEN_ANGLE_DEG         = 90;
+static const int CANSAT_BOTTOM_INITIAL_ANGLE_DEG   = 180;
+static const int CANSAT_BOTTOM_OPEN_ANGLE_DEG      = 90;
+static const int CO2_INITIAL_ANGLE_DEG             = 180;
+static const int CO2_OPEN_ANGLE_DEG                = 90;
 
-#ifndef APOGEE_TRIGGER_DURATION_MS
-#define APOGEE_TRIGGER_DURATION_MS  2000    // Firing pulse duration in milliseconds (e.g. 2.0 s)
-#endif
+// Deploy BOTH CanSat servos together when the vehicle is descending through
+// this altitude after apogee has been confirmed. Altitude is relative to the
+// calibrated launch pad (AGL).
+static const float CANSAT_DEPLOY_ALTITUDE_M = 800.0f;
 
-// Simulation state tracking
-bool apogee_pin_active = false;
-unsigned long apogee_pin_start_ms = 0;
+// Backup CO2 deployment timer. The timer starts only after LAUNCH DETECTED.
+// If normal apogee detection has not already deployed the CO2 servo by this
+// time, the failsafe opens it. Set this from your validated flight simulation
+// with sufficient margin beyond the expected time-to-apogee.
+static const unsigned long FAILSAFE_AFTER_LAUNCH_MS = 30000UL;
+
+// SG90-compatible PWM pulse limits used by ESP32Servo.
+static const int SERVO_MIN_PULSE_US = 500;
+static const int SERVO_MAX_PULSE_US = 2400;
+
+Servo cansatTopServo;
+Servo cansatBottomServo;
+Servo co2EjectionServo;
+
+// Deployment state tracking
+bool co2_ejected = false;
+bool cansats_deployed = false;
+bool failsafe_timer_started = false;
+bool failsafe_triggered = false;
+unsigned long launch_detected_t_ms = 0;
 bool sim_completed = false;
 
 
@@ -815,6 +841,86 @@ const char* axial_axis_sign() {
     return (((float)AXIAL_SIGN) >= 0.0f) ? "+" : "-";
 }
 
+// Forward declaration because the servo helpers also mirror deployment events
+// to EEPROM/SD. The implementation remains in the event-log section below.
+void store_flight_event(unsigned long time_ms, float altitude_m,
+                        FlightPhase state, const char *action);
+
+// ── Servo deployment helpers ────────────────────────────────────────────────
+int clamp_servo_angle(int angle_deg) {
+    if (angle_deg < 0) return 0;
+    if (angle_deg > 180) return 180;
+    return angle_deg;
+}
+
+void initialise_deployment_servos() {
+    // Allocate timers explicitly for ESP32Servo before attaching the servos.
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    ESP32PWM::allocateTimer(2);
+
+    cansatTopServo.setPeriodHertz(50);
+    cansatBottomServo.setPeriodHertz(50);
+    co2EjectionServo.setPeriodHertz(50);
+
+    cansatTopServo.attach(CANSAT_TOP_SERVO_PIN, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
+    cansatBottomServo.attach(CANSAT_BOTTOM_SERVO_PIN, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
+    co2EjectionServo.attach(CO2_EJECTION_SERVO_PIN, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
+
+    // Command all mechanisms to their safe/closed state at startup.
+    cansatTopServo.write(clamp_servo_angle(CANSAT_TOP_INITIAL_ANGLE_DEG));
+    cansatBottomServo.write(clamp_servo_angle(CANSAT_BOTTOM_INITIAL_ANGLE_DEG));
+    co2EjectionServo.write(clamp_servo_angle(CO2_INITIAL_ANGLE_DEG));
+
+    Serial.printf("[SERVO] CanSat TOP    GPIO %d -> initial %d deg\n",
+                  CANSAT_TOP_SERVO_PIN, CANSAT_TOP_INITIAL_ANGLE_DEG);
+    Serial.printf("[SERVO] CanSat BOTTOM GPIO %d -> initial %d deg\n",
+                  CANSAT_BOTTOM_SERVO_PIN, CANSAT_BOTTOM_INITIAL_ANGLE_DEG);
+    Serial.printf("[SERVO] CO2 EJECTION  GPIO %d -> initial %d deg\n",
+                  CO2_EJECTION_SERVO_PIN, CO2_INITIAL_ANGLE_DEG);
+}
+
+void deploy_co2(unsigned long t_ms, const char *reason) {
+    if (co2_ejected) return;
+
+    co2EjectionServo.write(clamp_servo_angle(CO2_OPEN_ANGLE_DEG));
+    co2_ejected = true;
+
+    Serial.println("\n============================================================");
+    Serial.printf("[DEPLOY] >>> CO2 EJECTION SERVO OPENED at %.3f s\n", t_ms / 1000.0f);
+    Serial.printf("[DEPLOY] >>> GPIO %d | %d deg -> %d deg\n",
+                  CO2_EJECTION_SERVO_PIN, CO2_INITIAL_ANGLE_DEG, CO2_OPEN_ANGLE_DEG);
+    Serial.printf("[DEPLOY] >>> Reason: %s\n", reason ? reason : "UNSPECIFIED");
+    Serial.println("============================================================\n");
+
+    store_flight_event(t_ms, xA_h, phase,
+                       failsafe_triggered ? "CO2 FAILSAFE TIMER" : "CO2 EJECTED APOGEE");
+}
+
+void deploy_both_cansats(unsigned long t_ms) {
+    if (cansats_deployed) return;
+
+    // These two commands are issued in the same 100 Hz loop iteration so both
+    // CanSat mechanisms begin opening effectively simultaneously.
+    cansatTopServo.write(clamp_servo_angle(CANSAT_TOP_OPEN_ANGLE_DEG));
+    cansatBottomServo.write(clamp_servo_angle(CANSAT_BOTTOM_OPEN_ANGLE_DEG));
+    cansats_deployed = true;
+
+    Serial.println("\n============================================================");
+    Serial.printf("[DEPLOY] >>> BOTH CANSAT SERVOS OPENED at %.3f s\n", t_ms / 1000.0f);
+    Serial.printf("[DEPLOY] >>> Altitude: %.2f m AGL | target %.2f m AGL\n",
+                  xA_h, CANSAT_DEPLOY_ALTITUDE_M);
+    Serial.printf("[DEPLOY] >>> TOP GPIO %d: %d deg -> %d deg\n",
+                  CANSAT_TOP_SERVO_PIN, CANSAT_TOP_INITIAL_ANGLE_DEG,
+                  CANSAT_TOP_OPEN_ANGLE_DEG);
+    Serial.printf("[DEPLOY] >>> BOTTOM GPIO %d: %d deg -> %d deg\n",
+                  CANSAT_BOTTOM_SERVO_PIN, CANSAT_BOTTOM_INITIAL_ANGLE_DEG,
+                  CANSAT_BOTTOM_OPEN_ANGLE_DEG);
+    Serial.println("============================================================\n");
+
+    store_flight_event(t_ms, xA_h, phase, "CANSATS DEPLOYED");
+}
+
 // ── Serial monitor helpers ───────────────────────────────────────────────────
 static char serial_command_buffer[16] = {0};
 static uint8_t serial_command_length = 0;
@@ -925,9 +1031,18 @@ void serial_banner() {
     Serial.println("Red codes: 1=EEPROM, 2=BMI160, 3=BMP280, 4=SD, 5=calibration.");
     Serial.println("Terminal commands: clr=clear previous EEPROM data, view=show EEPROM data.");
     Serial.printf("[SIM] SENSOR INJECTION MODE: Active (%u points from sim_data.h)\n", SIM_DATA_COUNT);
-    Serial.printf("[SIM] APOGEE TRIGGER PIN  : GPIO %d (%s, %lu ms pulse)\n",
-                  APOGEE_TRIGGER_PIN, APOGEE_TRIGGER_ACTIVE_HIGH ? "Active HIGH" : "Active LOW",
-                  (unsigned long)APOGEE_TRIGGER_DURATION_MS);
+    Serial.printf("[SERVO] CanSat TOP GPIO%d: initial=%d deg, open=%d deg\n",
+                  CANSAT_TOP_SERVO_PIN, CANSAT_TOP_INITIAL_ANGLE_DEG,
+                  CANSAT_TOP_OPEN_ANGLE_DEG);
+    Serial.printf("[SERVO] CanSat BOTTOM GPIO%d: initial=%d deg, open=%d deg\n",
+                  CANSAT_BOTTOM_SERVO_PIN, CANSAT_BOTTOM_INITIAL_ANGLE_DEG,
+                  CANSAT_BOTTOM_OPEN_ANGLE_DEG);
+    Serial.printf("[SERVO] CO2 GPIO%d: initial=%d deg, open=%d deg\n",
+                  CO2_EJECTION_SERVO_PIN, CO2_INITIAL_ANGLE_DEG, CO2_OPEN_ANGLE_DEG);
+    Serial.printf("[DEPLOY] CanSat deployment altitude: %.1f m AGL after apogee\n",
+                  CANSAT_DEPLOY_ALTITUDE_M);
+    Serial.printf("[FAILSAFE] CO2 backup timer: %lu ms after launch detection\n",
+                  FAILSAFE_AFTER_LAUNCH_MS);
     Serial.println();
 }
 
@@ -1257,9 +1372,8 @@ void setup() {
     // Pre-fill baro buffer
     for (int i = 0; i < BARO_SMOOTH_W; i++) baro_buf[i] = 44330.0f; // placeholder
 
-    // Initialize deployment pin to safe inactive state
-    pinMode(APOGEE_TRIGGER_PIN, OUTPUT);
-    digitalWrite(APOGEE_TRIGGER_PIN, APOGEE_TRIGGER_ACTIVE_HIGH ? LOW : HIGH);
+    // Initialise all three deployment servos in their safe/closed positions.
+    initialise_deployment_servos();
 
     while (millis() < cal_end) {
         float p = bmp.readPressure();
@@ -1317,7 +1431,11 @@ void setup() {
     Serial.println("\n============================================================");
     Serial.printf("[EVENT] >>> AVIONICS ARMED & PAD READY at t=0.000 s\n");
     Serial.printf("[EVENT] >>> Baseline Pressure: %.1f Pa | Acceleration detection: ACTIVE\n", ground_pressure_pa);
-    Serial.printf("[EVENT] >>> Apogee Trigger Pin: GPIO %d ready\n", APOGEE_TRIGGER_PIN);
+    Serial.printf("[EVENT] >>> CO2 servo: GPIO %d ready at %d deg\n",
+                  CO2_EJECTION_SERVO_PIN, CO2_INITIAL_ANGLE_DEG);
+    Serial.printf("[EVENT] >>> CanSat servos: GPIO %d + GPIO %d ready at %d/%d deg\n",
+                  CANSAT_TOP_SERVO_PIN, CANSAT_BOTTOM_SERVO_PIN,
+                  CANSAT_TOP_INITIAL_ANGLE_DEG, CANSAT_BOTTOM_INITIAL_ANGLE_DEG);
     Serial.println("============================================================\n");
 
     // setup() is complete. The next instruction entered is the live 100 Hz
@@ -1408,7 +1526,11 @@ void loop() {
         char action[24];
         if (prev_phase == PHASE_PAD && phase == PHASE_BOOST) {
             current_launch_started = true;
+            failsafe_timer_started = true;
+            launch_detected_t_ms = t_ms;
             snprintf(action, sizeof(action), "LAUNCH DETECTED");
+            Serial.printf("[FAILSAFE] Timer started at %.3f s; CO2 backup fires after %lu ms if apogee has not deployed it.\n",
+                          t_ms / 1000.0f, FAILSAFE_AFTER_LAUNCH_MS);
         } else {
             snprintf(action, sizeof(action), "%s -> %s",
                      phase_name(prev_phase), phase_name(phase));
@@ -1467,24 +1589,21 @@ void loop() {
                 apogee_t_ms     = t_ms;
                 phase           = PHASE_DESCENT;
 
-                // Fire the deployment trigger pin
-                digitalWrite(APOGEE_TRIGGER_PIN, APOGEE_TRIGGER_ACTIVE_HIGH ? HIGH : LOW);
-                apogee_pin_active = true;
-                apogee_pin_start_ms = millis();
-
                 Serial.println("\n============================================================");
-                Serial.printf("[EVENT] >>> *** APOGEE DETECTED & PIN TRIGGERED! ***\n");
+                Serial.printf("[EVENT] >>> *** APOGEE DETECTED ***\n");
                 Serial.printf("[EVENT] >>> Time: %.3f s | Apogee Altitude: %.2f m | Velocity: %.2f m/s\n",
                               apogee_t_ms / 1000.0f, apogee_h_m, xA_v);
-                Serial.printf("[EVENT] >>> GPIO %d (APOGEE_TRIGGER_PIN) -> ACTIVE %s (%lu ms pulse)\n",
-                              APOGEE_TRIGGER_PIN, APOGEE_TRIGGER_ACTIVE_HIGH ? "HIGH" : "LOW",
-                              (unsigned long)APOGEE_TRIGGER_DURATION_MS);
                 Serial.printf("[EVENT] >>> Phase: COAST -> DESCENT | Confirmed: %d samples\n", APOGEE_CONFIRM);
                 Serial.println("============================================================\n");
 
                 store_flight_event(apogee_t_ms, apogee_h_m,
                                    PHASE_DESCENT,
-                                   "APOGEE -> DESCENT (PIN FIRED)");
+                                   "APOGEE -> DESCENT");
+
+                // Normal deployment: CO2 is ejected immediately when apogee
+                // is confirmed. The failsafe timer remains harmless because
+                // deploy_co2() latches co2_ejected=true.
+                deploy_co2(apogee_t_ms, "APOGEE DETECTED");
             }
         } else {
             neg_vel_count = 0;
@@ -1493,12 +1612,27 @@ void loop() {
         neg_vel_count = 0;
     }
 
-    // ── Deployment Pin Pulse Safety Timeout ──────────────────────────────────
-    if (apogee_pin_active && (millis() - apogee_pin_start_ms >= APOGEE_TRIGGER_DURATION_MS)) {
-        apogee_pin_active = false;
-        digitalWrite(APOGEE_TRIGGER_PIN, APOGEE_TRIGGER_ACTIVE_HIGH ? LOW : HIGH);
-        Serial.printf("[EVENT] >>> PIN DEACTIVATED: GPIO %d -> OFF at %.3f s (Pulse duration of %lu ms elapsed)\n",
-                      APOGEE_TRIGGER_PIN, (millis() - arm_ms) / 1000.0f, (unsigned long)APOGEE_TRIGGER_DURATION_MS);
+    // ── CO2 failsafe timer ───────────────────────────────────────────────────
+    // The backup timer is referenced to LAUNCH DETECTED, not to avionics arm.
+    // It only acts if the normal apogee event has not already opened the CO2
+    // servo. This provides a redundant deployment path if apogee detection
+    // fails or is never confirmed.
+    if (failsafe_timer_started && !co2_ejected &&
+        (t_ms - launch_detected_t_ms >= FAILSAFE_AFTER_LAUNCH_MS)) {
+        failsafe_triggered = true;
+        Serial.println("[FAILSAFE] >>> CO2 deployment timeout reached before normal apogee deployment.");
+        deploy_co2(t_ms, "FAILSAFE AFTER LAUNCH");
+    }
+
+    // ── CanSat deployment on descent ────────────────────────────────────────
+    // Normal path: apogee_detected arms the 800 m release. If the apogee
+    // detector itself fails, expiry of the launch-referenced failsafe also
+    // arms the release. Negative velocity is still required so the CanSats
+    // cannot deploy while the rocket is climbing through 800 m.
+    bool cansat_release_armed = apogee_detected || failsafe_triggered;
+    if (cansat_release_armed && !cansats_deployed &&
+        xA_v < 0.0f && xA_h <= CANSAT_DEPLOY_ALTITUDE_M) {
+        deploy_both_cansats(t_ms);
     }
 
     // ── Simulation Completion Reporter ────────────────────────────────────────
