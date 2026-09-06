@@ -396,12 +396,7 @@ def update_platformio_ini(ini_path):
         print(f"  [WARN] {ini_path} not found; skipping platformio.ini update.")
         return
 
-    with open(ini_path, 'r', encoding='utf-8') as f:
-        ini_content = f.read()
-
-    # Create clean dual environments if not already configured
-    if '[env:simulation]' not in ini_content:
-        new_ini_content = """# PlatformIO Project Configuration File
+    new_ini_content = """# PlatformIO Project Configuration File
 # Kalman Apogee Detector — ESP32 (Flight & Simulation Targets)
 
 [platformio]
@@ -420,29 +415,28 @@ build_flags =
     -DCORE_DEBUG_LEVEL=0
     -DBOARD_HAS_PSRAM=0
     -DARDUINO_RUNNING_CORE=1
+    -I ../sim
 board_build.partitions = default.csv
 
 ; ── Simulation Target: Runs simulated rocket flight with pin triggers ─────────
 [env:simulation]
 build_src_filter = +<Sim_Injection_Ver.cpp> -<main.cpp> -<Hand_Test_Ver.cpp>
+extra_scripts = pre:../scripts/inject_sim_data.py
 
 ; ── Live Flight Target: Runs physical BMP280 + BMI160 hardware ────────────────
 [env:flight]
 build_src_filter = +<main.cpp> -<Sim_Injection_Ver.cpp> -<Hand_Test_Ver.cpp>
 """
-        with open(ini_path, 'w', encoding='utf-8') as f:
-            f.write(new_ini_content)
-        print("  platformio.ini updated with [env:simulation] and [env:flight].")
-    else:
-        print("  platformio.ini already has simulation environment.")
+    with open(ini_path, 'w', encoding='utf-8') as f:
+        f.write(new_ini_content)
+    print("  platformio.ini updated with [env:simulation], [env:flight], -I ../sim, and pre-build script.")
 
 def main():
-    workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    workspace_root = os.path.abspath(os.path.join(script_dir, ".."))
     search_dirs = [
-        os.path.join(workspace_root, "..", "sim"),
-        os.path.join(workspace_root, "..", "src"),
         os.path.join(workspace_root, "sim"),
-        os.path.join(workspace_root, "src"),
+        os.path.join(workspace_root, "..", "sim"),
         workspace_root
     ]
     
@@ -461,7 +455,8 @@ def main():
         sys.exit(1)
 
     mrc_project_dir = os.path.dirname(os.path.dirname(main_cpp))
-    header_output = os.path.join(mrc_project_dir, "include", "sim_data.h")
+    sim_header_output = os.path.join(workspace_root, "sim", "sim_data.h")
+    include_header_output = os.path.join(mrc_project_dir, "include", "sim_data.h")
     cpp_output = os.path.join(mrc_project_dir, "src", "Sim_Injection_Ver.cpp")
     ini_path = os.path.join(mrc_project_dir, "platformio.ini")
 
@@ -471,21 +466,36 @@ def main():
     print(f"Workspace root : {workspace_root}")
     print(f"Simulation CSV : {csv_file}")
     print(f"Source main.cpp: {main_cpp}")
-    print(f"Target Header  : {header_output}")
+    print(f"Sim Header     : {sim_header_output}")
+    print(f"Include Header : {include_header_output}")
     print(f"Target C++     : {cpp_output}")
     print("=" * 65)
 
     data_points = parse_sim_csv(csv_file)
-    generate_sim_data_header(data_points, header_output)
+    # Save to sim/ folder
+    generate_sim_data_header(data_points, sim_header_output)
+    # Also sync with include/ folder
+    generate_sim_data_header(data_points, include_header_output)
     generate_sim_cpp(main_cpp, cpp_output)
     update_platformio_ini(ini_path)
 
     print("=" * 65)
     print("  SIMULATION INJECTION BUILD COMPLETE!")
     print(f"  - main.cpp is 100% UNTOUCHED")
-    print(f"  - sim_data.h generated ({len(data_points)} points in PROGMEM)")
+    print(f"  - sim/sim_data.h generated ({len(data_points)} points in PROGMEM)")
+    print(f"  - include/sim_data.h synchronized")
     print(f"  - Sim_Injection_Ver.cpp generated with APOGEE_TRIGGER_PIN=25")
+    print(f"  - platformio.ini configured for automatic pre-build injection")
     print("=" * 65)
+
+# Support running directly or as PlatformIO pre: extra_script
+try:
+    if 'Import' in globals():
+        Import("env") # type: ignore
+        main()
+except Exception:
+    pass
 
 if __name__ == '__main__':
     main()
+
