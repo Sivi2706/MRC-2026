@@ -1,4 +1,3 @@
-
 /*
   AeroNotts LoRa Ground Station
   ESP32 + SX1278
@@ -121,6 +120,10 @@ inline bool resend_valid(const ResendRequest& r) {
 }
 
 
+// Explicit declaration prevents Arduino's .ino preprocessor from creating
+// a TelemetryPacket-based prototype before TelemetryPacket is declared.
+void printDecoded(const TelemetryPacket& p, float rssi, float snr, bool recovered);
+
 // Use the same radio wiring as the CanSat unless your receiver hardware differs.
 static constexpr int SPI_SCK_PIN  = 18;
 static constexpr int SPI_MISO_PIN = 19;
@@ -133,8 +136,8 @@ static constexpr int LORA_DIO1_PIN = 32;
 
 // Must exactly match CanSat settings.
 static constexpr float   LORA_FREQ_MHZ = 433.0;
-static constexpr float   LORA_BW_KHZ = 125.0;
-static constexpr uint8_t LORA_SF = 9;
+static constexpr float   LORA_BW_KHZ = 62.5;
+static constexpr uint8_t LORA_SF = 10;
 static constexpr uint8_t LORA_CR = 5;
 static constexpr uint8_t LORA_SYNC_WORD = 0x12;
 static constexpr int8_t  LORA_POWER_DBM = 17;   // downlink request power; verify local permitted RF output
