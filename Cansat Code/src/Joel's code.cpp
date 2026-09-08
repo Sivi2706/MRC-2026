@@ -232,6 +232,21 @@ struct FlightHeader {
 #pragma pack(pop)
 static_assert(sizeof(FlightHeader) == 64, "FlightHeader must be 64 bytes");
 
+// Arduino .ino preprocessing can auto-generate function prototypes before
+// custom structs are visible. These explicit declarations prevent that.
+struct AccelAverage {
+  double x;
+  double y;
+  double z;
+};
+
+uint16_t headerCrc(const FlightHeader& h);
+bool savePacketToFlash(const TelemetryPacket& p);
+bool loadPacketFromFlash(uint32_t packetNo, TelemetryPacket& p);
+AccelAverage averageAccelerometer(uint16_t samples);
+TelemetryPacket buildTelemetryPacket();
+void acceptResendRequest(const ResendRequest& req);
+
 // ---------------- Objects ----------------
 Adafruit_MPU6050 mpu;
 Adafruit_BMP280 bmp;
@@ -548,12 +563,6 @@ void waitForCalibrationEnter(const char* message) {
     delay(10);
   }
 }
-
-struct AccelAverage {
-  double x;
-  double y;
-  double z;
-};
 
 AccelAverage averageAccelerometer(uint16_t samples = 500) {
   AccelAverage v{0.0, 0.0, 0.0};
