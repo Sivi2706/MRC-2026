@@ -161,6 +161,7 @@
 // static constexpr int LORA_DIO1_PIN = 32;
 
 // static constexpr int FLASH_CS_PIN  = 33;
+// static constexpr int LED_PIN       = 2;
 
 // // ---------------- Mission timing ----------------
 // static constexpr uint32_t TELEMETRY_PERIOD_MS = 1000;
@@ -171,10 +172,10 @@
 
 // // ---------------- LoRa settings ----------------
 // // Same settings MUST be used at the ground station.
-// // SF9/BW125 keeps a 42-byte packet well below 1 s airtime and leaves time for recovery.
+// // SF9/BW125 keeps a 42-byte packet well below 1 s airtime (287 ms) and leaves time for recovery.
 // static constexpr float   LORA_FREQ_MHZ = 433.0;
-// static constexpr float   LORA_BW_KHZ = 62.5;
-// static constexpr uint8_t LORA_SF = 10;
+// static constexpr float   LORA_BW_KHZ = 125.0;
+// static constexpr uint8_t LORA_SF = 9;
 // static constexpr uint8_t LORA_CR = 5;               // 4/5
 // static constexpr uint8_t LORA_SYNC_WORD = 0x12;
 // static constexpr int8_t  LORA_POWER_DBM = 17;       // verify local permitted RF output
@@ -935,8 +936,10 @@
 
 //   pinMode(FLASH_CS_PIN, OUTPUT);
 //   pinMode(LORA_CS_PIN, OUTPUT);
+//   pinMode(LED_PIN, OUTPUT);
 //   digitalWrite(FLASH_CS_PIN, HIGH);
 //   digitalWrite(LORA_CS_PIN, HIGH);
+//   digitalWrite(LED_PIN, LOW);
 
 //   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 //   Wire.setClock(400000);
@@ -1042,8 +1045,10 @@
 //     // A single timeout/error does NOT permanently disable the radio.
 //     // The next 1 Hz cycle will try again.
 //     if (radioReady) {
+//       digitalWrite(LED_PIN, HIGH);
 //       int16_t state = radio.transmit(reinterpret_cast<const uint8_t*>(&packet),
 //                                      sizeof(packet));
+//       digitalWrite(LED_PIN, LOW);
 //       lastLoraTxOk = (state == RADIOLIB_ERR_NONE);
 //     } else {
 //       lastLoraTxOk = false;
